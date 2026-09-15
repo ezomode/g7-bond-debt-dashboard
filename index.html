@@ -88,17 +88,25 @@
   <div class="cards" id="cards"></div>
 
   <table id="table">
-    <thead><tr><th>Country</th><th>10Y yield</th><th>As of</th><th>Debt / GDP</th><th>Year</th></tr></thead>
+    <thead><tr><th>Country</th><th>10Y yield</th><th>As of</th><th>Debt / GDP</th><th>Period</th></tr></thead>
     <tbody></tbody>
   </table>
 </div>
 
 <footer>
   <p><strong>Sources (live, no key required):</strong>
-  yields — <a href="https://sdmx.oecd.org/" target="_blank" rel="noopener">OECD Data Explorer</a> SDMX REST API,
-  Main Economic Indicators, long-term interest rates (10-y gov bonds, monthly, % p.a.);
-  debt — OECD Economic Outlook No. 119, general government gross financial liabilities as % of GDP (annual; latest years include OECD estimates).
-  If the live API is unreachable, the page falls back to the embedded snapshot of 2026-09-15.</p>
+  yields — <a href="https://sdmx.oecd.org/" target="_blank" rel="noopener">OECD Data Explorer</a> SDMX REST API
+  (Main Economic Indicators, long-term interest rates: 10-y gov bonds, monthly, % p.a.),
+  overlaid with fresher feeds where available: Canada daily via
+  <a href="https://www.bankofcanada.ca/valet/" target="_blank" rel="noopener">Bank of Canada Valet</a>,
+  Germany monthly via <a href="https://www.bundesbank.de/" target="_blank" rel="noopener">Bundesbank</a> SDMX,
+  US daily via <a href="https://home.treasury.gov/" target="_blank" rel="noopener">US Treasury</a> and UK daily via
+  <a href="https://www.bankofengland.co.uk/" target="_blank" rel="noopener">Bank of England</a>
+  (snapshotted daily by <a href="https://github.com/ezomode/g7-bond-debt-dashboard/actions" target="_blank" rel="noopener">GitHub Actions</a>);
+  debt — OECD Economic Outlook No. 119, general government gross financial liabilities as % of GDP
+  (annual; latest years include OECD estimates), with DE/FR/IT replaced by quarterly Maastricht debt
+  from <a href="https://ec.europa.eu/eurostat" target="_blank" rel="noopener">Eurostat</a> (gov_10q_ggdebt, % of GDP).
+  If the live APIs are unreachable, the page falls back to the embedded snapshot of 2026-09-15.</p>
 </footer>
 
 <script>
@@ -118,6 +126,11 @@ let DATA = FALLBACK_DATA, liveOK = false;
 
 const YIELD_URL = c => `https://sdmx.oecd.org/public/rest/v1/data/OECD.SDD.STES,DSD_STES%40DF_FINMARK,4.0/${c}.M.IRLT......`;
 const DEBT_URL  = c => `https://sdmx.oecd.org/public/rest/v1/data/OECD.ECO.MAD,DSD_EO%40DF_EO,1.5/${c}.GGFLQ.A`;
+// Fresher, keyless, browser-callable sources (all verified CORS-open):
+const BOC_URL = 'https://www.bankofcanada.ca/valet/observations/BD.CDN.10YR.DQ.YLD/json?start_date=2001-01-01&order_dir=asc'; // Canada 10Y, daily (T-1)
+const BBK_URL = 'https://api.statistiken.bundesbank.de/rest/data/BBSIS/M.I.ZST.ZI.EUR.S1311.B.A604.R10XX.R.A.A._Z._Z.A?startPeriod=2000-01&format=csv&lang=en'; // Germany 10Y, monthly
+const EUROSTAT_DEBT_URL = 'https://ec.europa.eu/eurostat/api/dissemination/statistics/1.0/data/gov_10q_ggdebt?format=JSON&geo=DE&geo=FR&geo=IT&unit=PC_GDP&sector=S13&na_item=GD'; // DE/FR/IT Maastricht debt, quarterly % of GDP
+const DAILY_URL = 'data/daily-yields.json'; // US + UK daily 10Y yields, refreshed daily by GitHub Actions
 
 function parseSDMX(d, annual){
   const ds = d.data.dataSets[0];
@@ -133,6 +146,78 @@ function parseSDMX(d, annual){
                     : [t, +(+obs[k][0]).toFixed(2)];
     });
 }
+async function fetchJSON(url){
+  const r = await fetch(url);
+  if(!r.ok) throw new Error('HTTP '+r.status);
+  return r.json();
+}
+// Bank of Canada Valet: daily 10Y benchmark bond yield -> [["YYYY-MM-DD", v], ...]
+async function getBoC(){
+  const j = await fetchJSON(BOC_URL);
+  const pts = [];
+  for(const o of j.observations){
+    const cell = o['BD.CDN.10YR.DQ.YLD'];
+    const v = cell && cell.v;
+    if(v === undefined || v === null || v === '') continue;
+    pts.push([o.d, +(+v).toFixed(2)]);
+  }
+  return pts;
+}
+// Bundesbank SDMX CSV: monthly 10Y Svensson zero-coupon estimate -> [["YYYY-MM", v], ...]
+async function getBundesbank(){
+  const r = await fetch(BBK_URL);
+  if(!r.ok) throw new Error('HTTP '+r.status);
+  const txt = (await r.text()).replace(/^\uFEFF/, '');
+  const pts = [];
+  for(const line of txt.split('\n')){
+    const m = line.match(/^"?(\d{4}-\d{2})"?,([\d.]+)/);
+    if(m) pts.push([m[1], +(+m[2]).toFixed(2)]);
+  }
+  if(!pts.length) throw new Error('empty Bundesbank response');
+  return pts;
+}
+// Eurostat JSON-stat: quarterly Maastricht debt % of GDP -> {DEU:[["YYYY-MM",v]...], ...}
+async function getEurostatDebt(){
+  const j = await fetchJSON(EUROSTAT_DEBT_URL);
+  const dims = j.dimension, sizes = j.size, ids = Object.keys(dims);
+  const geoPos = ids.indexOf('geo'), timePos = ids.indexOf('time');
+  const stride = i => sizes.slice(i+1).reduce((a,b)=>a*b, 1);
+  const gs = stride(geoPos), ts = stride(timePos);
+  const geoIdx = dims.geo.category.index, timeIdx = dims.time.category.index;
+  const geoMap = {DE:'DEU', FR:'FRA', IT:'ITA'};
+  const qm = {'1':'03','2':'06','3':'09','4':'12'};
+  const out = {};
+  for(const [g, gp] of Object.entries(geoIdx)){
+    const code = geoMap[g];
+    if(!code) continue;
+    const pts = [];
+    for(const [t, tp] of Object.entries(timeIdx)){
+      const v = j.value[String(gp*gs + tp*ts)];
+      if(v === null || v === undefined) continue;
+      const m = t.match(/(\d{4})-Q([1-4])/);
+      if(!m) continue;
+      pts.push([`${m[1]}-${qm[m[2]]}`, +(+v).toFixed(1)]);
+    }
+    pts.sort((a,b)=> a[0]<b[0] ? -1 : 1);
+    if(pts.length) out[code] = pts;
+  }
+  if(!Object.keys(out).length) throw new Error('empty Eurostat response');
+  return out;
+}
+// Overlay a fresher series onto a monthly OECD series: drop monthly points from
+// the fresher series' first month onward, then append the fresh points.
+function mergeYields(monthly, fresh){
+  if(!fresh || !fresh.length) return monthly;
+  const firstMonth = fresh[0][0].slice(0,7);
+  return monthly.filter(p => p[0] < firstMonth).concat(fresh);
+}
+// Overlay quarterly debt onto annual OECD debt: keep annual before the first
+// quarterly year, then use quarterly.
+function mergeDebt(annual, quarterly){
+  if(!quarterly || !quarterly.length) return annual;
+  const firstYear = parseInt(quarterly[0][0].slice(0,4), 10);
+  return annual.filter(p => p[0] < firstYear).concat(quarterly);
+}
 async function loadLive(){
   const codes = COUNTRIES.map(c=>c.code);
   const get = async (url, annual) => {
@@ -140,10 +225,35 @@ async function loadLive(){
     if(!r.ok) throw new Error('HTTP '+r.status);
     return parseSDMX(await r.json(), annual);
   };
+  // Shared one-shot fetches (failures caught per country below)
+  const dailyP = fetchJSON(DAILY_URL).catch(()=>null);
+  const euroP = getEurostatDebt().catch(()=>null);
   const y = {}, db = {};
   await Promise.all(codes.map(async c => {
-    try { y[c]  = await get(YIELD_URL(c), false); } catch(e){ y[c]  = FALLBACK_DATA.yields[c]; }
-    try { db[c] = await get(DEBT_URL(c),  true ); } catch(e){ db[c] = FALLBACK_DATA.debt[c]; }
+    try {
+      let s = await get(YIELD_URL(c), false);
+      if(c==='CAN'){ try { s = mergeYields(s, await getBoC()); } catch(e){} }
+      else if(c==='DEU'){ try { s = mergeYields(s, await getBundesbank()); } catch(e){} }
+      else if(c==='USA' || c==='GBR'){
+        const dj = await dailyP;
+        if(dj && dj[c] && dj[c].length) s = mergeYields(s, dj[c]);
+      }
+      y[c] = s;
+    } catch(e){ y[c] = FALLBACK_DATA.yields[c]; }
+    try {
+      if(c==='DEU' || c==='FRA' || c==='ITA'){
+        const eq = await euroP;
+        if(eq && eq[c]){
+          let a;
+          try { a = await get(DEBT_URL(c), true); } catch(e){ a = FALLBACK_DATA.debt[c]; }
+          db[c] = mergeDebt(a, eq[c]);
+        } else {
+          db[c] = await get(DEBT_URL(c), true);
+        }
+      } else {
+        db[c] = await get(DEBT_URL(c), true);
+      }
+    } catch(e){ db[c] = FALLBACK_DATA.debt[c]; }
   }));
   return {yields:y, debt:db};
 }
@@ -156,7 +266,8 @@ function cutoffMonths(){
   return monthIdx(last) - state.range*12;
 }
 const inRangeM = t => { const c = cutoffMonths(); return c===null || monthIdx(t) >= c; };
-const inRangeY = y => { const c = cutoffMonths(); return c===null || (Math.floor(c/12))*1 <= y; };
+const debtMonth = p => typeof p[0] === 'number' ? `${p[0]}-06` : p[0];
+const inRangeY = p => { const c = cutoffMonths(); return c===null || monthIdx(debtMonth(p)) >= Math.floor(c/12)*12; };
 
 function render(){
   const {mode, country} = state;
@@ -170,8 +281,8 @@ function render(){
 function renderHybrid(C){
   const y = DATA.yields[C.code].filter(p=>inRangeM(p[0]));
   const d = DATA.debt[C.code].filter(p=>inRangeY(p[0]));
-  // map annual debt onto mid-year month for bar placement
-  const debtPts = d.map(([yr,v]) => [`${yr}-06`, v]);
+  // map debt onto months for bar placement (annual -> mid-year, quarterly -> quarter-end month)
+  const debtPts = d.map(([k,v]) => [typeof k === 'number' ? `${k}-06` : k, v]);
   document.getElementById('chartTitle').textContent = `${C.name} — 10Y yield vs debt-to-GDP`;
   document.getElementById('chartSub').textContent = 'Line: 10-year government bond yield (%, left) · Bars: general-government gross debt (% of GDP, right)';
   chart.setOption({
@@ -202,7 +313,7 @@ function renderHybrid(C){
 function renderCompare(kind){
   const isY = kind==='yields';
   document.getElementById('chartTitle').textContent = isY ? 'G7 — 10-year government bond yields' : 'G7 — general-government debt (% of GDP)';
-  document.getElementById('chartSub').textContent = isY ? 'Monthly, percent per annum' : 'Annual, percent of GDP (latest years include OECD estimates)';
+  document.getElementById('chartSub').textContent = isY ? 'Monthly, percent per annum (CA daily; US/UK daily via snapshot)' : 'Percent of GDP — DE/FR/IT quarterly (Eurostat, Maastricht); others annual (OECD; latest years include estimates)';
   const series = COUNTRIES.map(C => {
     const pts = (isY ? DATA.yields[C.code].filter(p=>inRangeM(p[0]))
                      : DATA.debt[C.code].filter(p=>inRangeY(p[0])));
@@ -221,18 +332,30 @@ function renderCompare(kind){
   }, true);
 }
 
-function yoy(pts, isMonth){
-  if(pts.length < 13) return null;
-  const last = pts[pts.length-1][1];
-  const target = isMonth ? pts[pts.length-13][1] : pts[pts.length-2][1];
-  return last - target;
+// approx day number for "YYYY-MM" or "YYYY-MM-DD"
+const dayNum = s => { const p = s.split('-').map(Number); return p[0]*372 + (p[1]-1)*31 + (p[2]||15); };
+function yoyYield(pts){ // change vs ~1 year earlier; works for monthly and daily series
+  if(pts.length < 2) return null;
+  const last = pts[pts.length-1], target = dayNum(last[0]) - 372;
+  let base = null;
+  for(let i = pts.length-2; i >= 0; i--){
+    if(dayNum(pts[i][0]) <= target){ base = pts[i]; break; }
+  }
+  return base ? last[1] - base[1] : null;
+}
+function yoyDebt(pts){ // annual: vs prior year; quarterly: vs same quarter last year
+  if(pts.length < 2) return null;
+  const quarterly = typeof pts[pts.length-1][0] === 'string';
+  const back = quarterly ? 5 : 2;
+  if(pts.length < back) return null;
+  return pts[pts.length-1][1] - pts[pts.length-back][1];
 }
 function renderCards(){
   const el = document.getElementById('cards'); el.innerHTML='';
   COUNTRIES.forEach(C=>{
     const y = DATA.yields[C.code], d = DATA.debt[C.code];
     const ly = y[y.length-1], ld = d[d.length-1];
-    const dy = yoy(y,true), dd = yoy(d,false);
+    const dy = yoyYield(y), dd = yoyDebt(d);
     const card = document.createElement('div');
     card.className = 'card' + (C.code===state.country?' sel':'');
     card.style.setProperty('--c', C.color);
@@ -289,7 +412,7 @@ window.addEventListener('resize', ()=>chart.resize());
   try{
     const live = await loadLive();
     DATA = live; liveOK = true;
-    st.textContent = '● live data · OECD API';
+    st.textContent = '● live data · OECD + BoC + Bundesbank + Eurostat';
     st.className = 'badge live';
     render();
   }catch(e){
@@ -297,7 +420,7 @@ window.addEventListener('resize', ()=>chart.resize());
     st.className = 'badge cached';
     const er = document.getElementById('err');
     er.style.display='block';
-    er.textContent = 'Live OECD API unreachable — showing the embedded snapshot from 2026-09-15.';
+    er.textContent = 'Live data APIs unreachable — showing the embedded snapshot from 2026-09-15.';
   }
 })();
 </script>
