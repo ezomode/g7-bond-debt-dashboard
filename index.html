@@ -266,7 +266,7 @@ function cutoffMonths(){
   return monthIdx(last) - state.range*12;
 }
 const inRangeM = t => { const c = cutoffMonths(); return c===null || monthIdx(t) >= c; };
-const debtMonth = p => typeof p[0] === 'number' ? `${p[0]}-06` : p[0];
+const debtMonth = k => typeof k === 'number' ? `${k}-06` : k;
 const inRangeY = p => { const c = cutoffMonths(); return c===null || monthIdx(debtMonth(p)) >= Math.floor(c/12)*12; };
 
 function render(){
